@@ -30,27 +30,57 @@ async def upload_csv(file: UploadFile = File(...)):
     df = pd.read_csv(io.BytesIO(contents))
 
     column_mapping = map_columns(df)
+
     baselines = {}
+    volatility = {}
     deviation_rows = []
 
+    # --- Baseline + Personal Volatility (IQR) ---
     for signal, col in column_mapping.items():
-        baselines[signal] = df[col].median()
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+        clean_series = df[col].dropna()
 
+        if clean_series.empty:
+            continue
+
+        baseline = clean_series.median()
+
+        q1 = clean_series.quantile(0.25)
+        q3 = clean_series.quantile(0.75)
+        iqr = q3 - q1
+
+        if iqr == 0:
+            iqr = 1e-6
+
+        baselines[signal] = baseline
+        volatility[signal] = iqr
+
+    # --- Deviation Detection ---
     for idx, row in df.iterrows():
         triggered = []
+
         for signal, col in column_mapping.items():
-            baseline = baselines[signal]
+            if signal not in baselines:
+                continue
+
             value = row[col]
+            baseline = baselines[signal]
+
+            if pd.isna(value):
+                continue
 
             if signal == "heart_rate":
                 if abs(value - baseline) / baseline > 0.15:
                     triggered.append("heart_rate")
+
             elif signal == "spo2":
                 if baseline - value > 2:
                     triggered.append("spo2")
+
             elif signal == "systolic_bp":
                 if abs(value - baseline) > 10:
                     triggered.append("systolic_bp")
+
             elif signal == "diastolic_bp":
                 if abs(value - baseline) > 5:
                     triggered.append("diastolic_bp")
@@ -62,6 +92,7 @@ async def upload_csv(file: UploadFile = File(...)):
                 "severity": len(triggered)
             })
 
+    # --- Generate PDF ---
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=letter)
     elements = []
@@ -70,20 +101,29 @@ async def upload_csv(file: UploadFile = File(...)):
     elements.append(Paragraph("Liquid AI Exploratory Deviation Report", styles["Heading1"]))
     elements.append(Spacer(1, 12))
 
-    baseline_table_data = [["Signal", "Median Baseline"]]
-    for signal, value in baselines.items():
-        baseline_table_data.append([signal, round(value, 2)])
+    # Baseline Table with Volatility
+    baseline_table_data = [["Signal", "Median Baseline", "Volatility (IQR)"]]
+
+    for signal in baselines:
+        baseline_table_data.append([
+            signal,
+            round(baselines[signal], 2),
+            round(volatility[signal], 2)
+        ])
 
     baseline_table = Table(baseline_table_data)
     baseline_table.setStyle([
         ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
         ('GRID', (0, 0), (-1, -1), 0.5, colors.black)
     ])
+
     elements.append(Paragraph("Baselines:", styles["Heading2"]))
     elements.append(baseline_table)
     elements.append(Spacer(1, 20))
 
+    # Deviation Table
     deviation_table_data = [["Row", "Signals Triggered", "Severity"]]
+
     for row in deviation_rows:
         deviation_table_data.append([row["row"], row["signals"], row["severity"]])
 
@@ -92,6 +132,7 @@ async def upload_csv(file: UploadFile = File(...)):
         ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
         ('GRID', (0, 0), (-1, -1), 0.5, colors.black)
     ])
+
     elements.append(Paragraph("Deviation Events:", styles["Heading2"]))
     elements.append(deviation_table)
     elements.append(Spacer(1, 20))
@@ -125,5 +166,8 @@ async def upload_csv(file: UploadFile = File(...)):
     doc.build(elements)
     buffer.seek(0)
 
-    return StreamingResponse(buffer, media_type="application/pdf",
-                             headers={"Content-Disposition": "attachment; filename=liquid_ai_report.pdf"})
+    return StreamingResponse(
+        buffer,
+        media_type="application/pdf",
+        headers={"Content-Disposition": "attachment; filename=liquid_ai_report.pdf"}
+    )
